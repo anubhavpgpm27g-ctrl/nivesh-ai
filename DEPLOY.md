@@ -30,7 +30,8 @@ Save. Never upload a `.env` file with your key to GitHub.
 - Yahoo's NSE prices are near real-time at best and can lag the exchange by several minutes. For a
   certified tick-by-tick feed you need a broker or licensed data API (e.g. Upstox, Angel One SmartAPI,
   Zerodha Kite Connect).
-- Auto-refresh runs only during NSE hours (9:15–15:30 IST, Mon–Fri). Use the sidebar to change the interval
+- Prices come from Yahoo's live stream (one shared connection), with polling as a fallback. The screen refreshes every 3 s by default
+  during NSE hours (9:15–15:30 IST, Mon–Fri). Use the sidebar to change the speed
   or pause it.
 - If you see "Too Many Requests" errors, Yahoo is rate-limiting the server. Raise the refresh interval
   to 60–120 s and wait a few minutes.

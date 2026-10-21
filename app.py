@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 
 from app.market_data import (IST, display_name, fetch_history, fetch_intraday, fetch_live_quote,
                              indian_symbol, inr, lakh_crore, market_status)
+from app.live_stream import get_feed
 from app.prediction import make_prediction
 from app.research import answer_research_question
 
@@ -39,12 +40,34 @@ status = market_status()
 dot = {"open": "#16a34a", "pre": "#d97706", "closed": "#9ca3af"}[status["state"]]
 st.sidebar.markdown(f"<span class='live-dot' style='background:{dot}'></span>**{status['label']}** · {status['time']}", unsafe_allow_html=True)
 auto = st.sidebar.toggle("Auto-refresh live prices", value=True, help="Refreshes quotes while NSE is open. Turn off to save data/API calls.")
-every = st.sidebar.select_slider("Refresh every", options=[15, 30, 60, 120], value=30, format_func=lambda s: f"{s} s")
+every = st.sidebar.select_slider("Screen refresh", options=[2, 3, 5, 10, 15, 30, 60], value=3, format_func=lambda s: f"every {s} s",
+                                 help="Live prices arrive through a stream, so fast refreshes don't send extra requests to Yahoo.")
 if st.sidebar.button("Refresh now"):
     st.cache_data.clear()
     st.rerun()
 RUN_EVERY = f"{every}s" if (auto and status["state"] in ("open", "pre")) else None
-st.sidebar.caption("Market data: Yahoo Finance via yfinance. Near real-time at best; NSE quotes can be delayed by several minutes. Verify with your broker.")
+
+# Start the shared live stream for everything this visitor can see.
+feed = get_feed()
+_pf_syms = [str(s) for s in st.session_state.portfolio.get("Symbol", []) if str(s).strip() and str(s).upper() != "NAN"]
+feed.ensure([indian_symbol(s) for s in ["^NSEI", "^BSESN", "^NSEBANK", "RELIANCE", "TCS", *st.session_state.watchlist, *_pf_syms]])
+
+
+@st.fragment(run_every="5s")
+def stream_status():
+    fs = feed.status()
+    age = fs["last_message_age"]
+    if fs["connected"] and age is not None and age < 120:
+        st.markdown(f"<span class='live-dot' style='background:#16a34a'></span>**Live stream on** · last tick {age:.0f}s ago", unsafe_allow_html=True)
+    elif fs["connected"]:
+        st.markdown("<span class='live-dot' style='background:#d97706'></span>**Stream connected** · waiting for trades", unsafe_allow_html=True)
+    else:
+        st.markdown("<span class='live-dot' style='background:#9ca3af'></span>**Stream reconnecting** · using polled prices", unsafe_allow_html=True)
+
+
+with st.sidebar:
+    stream_status()
+st.sidebar.caption("Market data: Yahoo Finance (live stream + polling fallback). Fast, but not an exchange-certified feed; verify with your broker.")
 
 st.title("Nivesh AI")
 st.caption("A beginner-friendly investing research workspace for Indian markets.")
@@ -53,6 +76,19 @@ if not status["is_open"]:
 
 
 # ---------------- Helpers ----------------
+def with_live_point(bars: pd.DataFrame, q):
+    """Append the latest streamed price to intraday bars so the chart moves between 1-minute candles."""
+    if not q or q.get("source") != "stream" or bars is None or bars.empty:
+        return bars
+    t = pd.Timestamp(q["bar_time"])
+    if t.tzinfo is None:
+        t = t.tz_localize(IST)
+    if t <= bars.index[-1] or t.date() != bars.index[-1].date():
+        return bars
+    row = pd.DataFrame({"Close": [q["last"]]}, index=pd.DatetimeIndex([t.tz_convert(bars.index.tz)], name=bars.index.name))
+    return pd.concat([bars[["Close"]], row])
+
+
 def price_chart(df: pd.DataFrame, height=260, time_fmt="%d %b %y"):
     data = df[["Close"]].dropna().reset_index()
     data.columns = ["Time", "Close"]
@@ -82,10 +118,16 @@ def quote_metric(label, symbol, prefix="₹"):
     return q
 
 
-def as_of(q):
+def live_note(q):
+    if q.get("source") == "stream":
+        return f"🟢 Live tick · {as_of(q, seconds=True)}"
+    return f"Polled price · {as_of(q)} · can lag a few minutes"
+
+
+def as_of(q, seconds=False):
     t = q.get("bar_time") or q["fetched_at"]
     try:
-        return pd.Timestamp(t).tz_convert(IST).strftime("%d %b %Y, %H:%M IST")
+        return pd.Timestamp(t).tz_convert(IST).strftime("%d %b %Y, %H:%M:%S IST" if seconds else "%d %b %Y, %H:%M IST")
     except Exception:
         return str(t)
 
@@ -101,8 +143,8 @@ if page == "Overview":
                                                   ("RELIANCE", "RELIANCE", "₹"), ("TCS", "TCS", "₹")]):
             with col:
                 quote_metric(label, sym, pre)
-        st.caption(f"Last refreshed {datetime.now(IST).strftime('%H:%M:%S IST')}"
-                   + (f" · auto-refresh every {every} s" if RUN_EVERY else " · auto-refresh paused (market closed or turned off)"))
+        st.caption(f"Screen refreshed {datetime.now(IST).strftime('%H:%M:%S IST')}"
+                   + (f" · updating every {every} s" if RUN_EVERY else " · auto-refresh paused (market closed or turned off)"))
     live_tiles()
 
     st.divider()
@@ -118,11 +160,11 @@ if page == "Overview":
                 return
             q = quote_metric(f"{symbol} · {display_name(symbol)} · live", symbol)
             if q:
-                st.caption(f"Price as of {as_of(q)} · Day range ₹{inr(q.get('day_low'))} – ₹{inr(q.get('day_high'))}")
+                st.caption(f"{live_note(q)} · Day range ₹{inr(q.get('day_low'))} – ₹{inr(q.get('day_high'))}")
             if view.startswith("Today"):
                 bars, err = fetch_intraday(symbol)
                 if bars is not None and not bars.empty:
-                    price_chart(bars, 260, "%H:%M")
+                    price_chart(with_live_point(bars, q), 260, "%H:%M")
                 else:
                     st.warning(err)
             else:
@@ -168,7 +210,7 @@ elif page == "Markets & Stocks":
                 m2.metric("Day low", f"₹{inr(q.get('day_low'))}")
                 m3.metric("52-week high", f"₹{inr(q.get('year_high'))}")
                 m4.metric("52-week low", f"₹{inr(q.get('year_low'))}")
-                st.caption(f"Price as of {as_of(q)} · Yahoo Finance, may be delayed")
+                st.caption(live_note(q))
         live_header()
 
         hist, err = fetch_history(symbol, period=period, interval=interval)
@@ -245,12 +287,12 @@ elif page == "Watchlist":
                          "Change (₹)": round(q["change"], 2) if q and q.get("change") is not None else None,
                          "Change (%)": round(q["change_pct"], 2) if q and q.get("change_pct") is not None else None,
                          "Day low (₹)": q.get("day_low") if q else None, "Day high (₹)": q.get("day_high") if q else None,
-                         "As of": as_of(q) if q else "—"})
+                         "As of": (("🟢 " + as_of(q, seconds=True)[-12:]) if q.get("source") == "stream" else as_of(q)) if q else "—"})
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True,
                      column_config={"Change (%)": st.column_config.NumberColumn(format="%+.2f%%"),
                                     "Day low (₹)": st.column_config.NumberColumn(format="%.2f"),
                                     "Day high (₹)": st.column_config.NumberColumn(format="%.2f")})
-        st.caption(f"Last refreshed {datetime.now(IST).strftime('%H:%M:%S IST')}")
+        st.caption(f"Screen refreshed {datetime.now(IST).strftime('%H:%M:%S IST')} · 🟢 = price from the live stream")
     live_watchlist()
 
     remove = st.selectbox("Remove a symbol", [""] + st.session_state.watchlist)

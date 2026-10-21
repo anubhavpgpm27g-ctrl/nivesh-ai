@@ -90,9 +90,9 @@ def fetch_intraday(symbol: str):
         return None, f"Provider request failed: {exc}"
 
 
-@st.cache_data(ttl=20, show_spinner=False)
-def fetch_live_quote(symbol: str):
-    """Latest traded price and day stats. Returns (quote_dict, error)."""
+@st.cache_data(ttl=10, show_spinner=False)
+def _poll_quote(symbol: str):
+    """Polled quote (fallback when the live stream has no tick yet). Returns (quote_dict, error)."""
     ticker = indian_symbol(symbol)
     quote = {"symbol": ticker, "name": display_name(symbol), "fetched_at": datetime.now(IST)}
     try:
@@ -123,6 +123,34 @@ def fetch_live_quote(symbol: str):
     quote["change"] = quote["last"] - p if p else None
     quote["change_pct"] = (quote["last"] / p - 1) * 100 if p else None
     return quote, None
+
+
+def fetch_live_quote(symbol: str):
+    """Best available price: the live stream tick if there is one, else the polled quote."""
+    from app.live_stream import get_feed  # local import avoids a cycle
+    ticker = indian_symbol(symbol)
+    feed = get_feed()
+    feed.ensure([ticker])
+    polled, err = _poll_quote(symbol)
+    tick = feed.tick(ticker)
+    if not tick:
+        if polled:
+            polled = {**polled, "source": "poll"}
+        return polled, err
+    q = dict(polled or {"symbol": ticker, "name": display_name(symbol)})
+    q["last"] = tick["price"]
+    q["bar_time"] = datetime.fromtimestamp(tick["time"], IST)
+    q["fetched_at"] = datetime.now(IST)
+    for k in ("day_high", "day_low", "open"):
+        if tick.get(k):
+            q[k] = tick[k]
+    prev = tick.get("prev_close") or q.get("prev_close")
+    q["prev_close"] = prev
+    q["change"] = q["last"] - prev if prev else tick.get("change")
+    q["change_pct"] = (q["last"] / prev - 1) * 100 if prev else tick.get("change_pct")
+    q["source"] = "stream"
+    q["tick_age"] = max(0.0, datetime.now(IST).timestamp() - tick["received"])
+    return q, None
 
 
 def _num(obj, key):
